@@ -26,7 +26,14 @@ from sgtree import claude_helper
 
 def _collect_judge_items(severity_result):
     """Judge items from the live severity run's own explanations — grading
-    the actual free text this eval suite produced, not a hand-picked sample."""
+    the actual free text this eval suite produced, not a hand-picked sample.
+
+    input_facts must carry the real rule/exposure facts the explanation was
+    grounded in (from live_severity.py's result rows), not just the finding
+    key and the severity label — a judge asked to check groundedness against
+    too little context will (correctly) flag a perfectly grounded
+    explanation as fabricating facts, since from its point of view those
+    facts aren't in the input it was given."""
     items = []
     for row in severity_result['results']:
         if not row.get('severity_explanation'):
@@ -34,7 +41,12 @@ def _collect_judge_items(severity_result):
         items.append({
             'id': f"severity:{row['fixture']}:{row['finding_key']}",
             'kind': 'severity_explanation',
-            'input_facts': {'finding_key': row['finding_key'], 'assigned_severity': row['actual_severity']},
+            'input_facts': {
+                'finding_key': row['finding_key'],
+                'assigned_severity': row['actual_severity'],
+                'rule': row.get('rule_facts'),
+                'exposure_signals': row.get('exposure_signals'),
+            },
             'output_text': row['severity_explanation'],
         })
     return items

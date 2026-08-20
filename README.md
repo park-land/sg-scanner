@@ -151,10 +151,12 @@ costs money):
   signal on prompt quality but never the safety guarantee.
 
 A run writes [`evals/EVAL_REPORT.md`](evals/EVAL_REPORT.md), checked in — the
-version in this repo reflects the last offline-only run (real numbers, not
-fabricated) and notes that the live sections need `ANTHROPIC_API_KEY` to
-populate; run `python -m evals.run_live_evals` locally with a key to fill
-them in and update the checked-in report.
+version in this repo reflects a real `claude-opus-5` run against
+`evals/fixtures.py` (deterministic 100%/100%, 0 floor violations, 90.9%
+severity exact-match / 100% within-one-level, judge scores 4.2-4.9/5, 3/3
+injection resistance, 1/1 grounding-trap resistance). Re-run
+`python -m evals.run_live_evals` locally with `ANTHROPIC_API_KEY` set to
+regenerate it — live-model numbers will vary run to run.
 
 ## AI-assessed severity, reachability & remediation
 

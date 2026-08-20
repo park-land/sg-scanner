@@ -61,7 +61,14 @@ def _get_client():
 
 
 def _call(model, system, user_content):
-    """One Claude call, tolerant of any failure. Returns the response text or None."""
+    """One Claude call, tolerant of any failure. Returns the response text or None.
+
+    max_tokens=16000: every caller here batches a variable-length list into
+    one request (ENIs, rules, findings, judge items), and a truncated
+    response isn't a partial result — it's invalid JSON, so
+    _parse_json_object silently returns {} and the whole batch is lost, not
+    just the entries that didn't fit. 4096 was tight enough to actually hit
+    this in practice with as few as ~10 items in one batch."""
     client = _get_client()
     if client is None:
         return None
@@ -69,7 +76,7 @@ def _call(model, system, user_content):
     try:
         response = client.messages.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=16000,
             system=system,
             messages=[{'role': 'user', 'content': user_content}],
         )
@@ -90,6 +97,14 @@ def _call(model, system, user_content):
 
 
 def _parse_json_object(text):
+    """Every caller's prompt frames the *input* as "one JSON object per
+    line" (for readability at the byte level) and asks for a single combined
+    JSON object back. Observed in practice: with enough input lines, the
+    model sometimes mirrors that per-line framing into the *output* too —
+    one syntactically valid {...} per line instead of one combined object —
+    which is invalid as a whole (multiple top-level JSON values) and would
+    otherwise silently parse to nothing, losing the entire batch rather than
+    just reformatting it. Tolerate that shape by merging line-by-line."""
     if not text:
         return {}
     text = text.strip()
@@ -98,10 +113,25 @@ def _parse_json_object(text):
         text = text.strip('`')
         if text.startswith('json'):
             text = text[4:]
+    text = text.strip()
     try:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
+        pass
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
         return {}
+    merged = {}
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        if not isinstance(obj, dict):
+            return {}
+        merged.update(obj)
+    return merged
 
 
 def _parse_guess_with_reasoning(text, guess_key):
@@ -153,9 +183,10 @@ def classify_enis(enis, model=DEFAULT_MODEL):
         "text, InterfaceType, RequesterId) led you there. "
         "If you genuinely cannot infer anything beyond 'unknown', omit that "
         "eni_id from your output rather than guessing wildly. "
-        "Respond with ONLY a JSON object mapping eni_id -> "
-        '{"label": <short guess>, "reasoning": <one sentence>}, no other text, '
-        "no markdown code fences."
+        "Respond with ONLY a single combined JSON object mapping every eni_id to its "
+        'result — {"label": <short guess>, "reasoning": <one sentence>}, ... — one '
+        "object with all eni_ids as keys, NOT one JSON object per line even though "
+        "the ENIs above are listed that way. No other text, no markdown code fences."
     )
     user_content = "ENIs to classify (one JSON object per line):\n" + "\n".join(lines)
 
@@ -211,9 +242,10 @@ def guess_external_sources(rules, model=DEFAULT_MODEL):
         "so in the reasoning. Don't invent a vendor or person that neither the "
         "description nor the RDAP data supports. If both are empty or unhelpful, "
         "omit that rule_id from your output rather than guessing wildly. "
-        "Respond with ONLY a JSON object mapping rule_id -> "
-        '{"guess": <short summary>, "reasoning": <one sentence>}, no other text, '
-        "no markdown code fences."
+        "Respond with ONLY a single combined JSON object mapping every rule_id to its "
+        'result — {"guess": <short summary>, "reasoning": <one sentence>}, ... — one '
+        "object with all rule_ids as keys, NOT one JSON object per line even though "
+        "the rules above are listed that way. No other text, no markdown code fences."
     )
     user_content = "External rules to guess at (one JSON object per line):\n" + "\n".join(lines)
 
@@ -251,9 +283,11 @@ def suggest_rule_descriptions(rules, model=DEFAULT_MODEL):
         "etc.) where possible; otherwise describe it plainly (e.g. 'TCP 8080 "
         "from 10.0.0.0/8'). 2) 'reasoning' — one sentence saying what you based "
         "it on (the port's well-known purpose, the source SG's name, the CIDR's "
-        "scope, etc.). Respond with ONLY a JSON object mapping rule_id -> "
-        '{"description": <short suggestion>, "reasoning": <one sentence>}, no '
-        "other text, no markdown code fences."
+        "scope, etc.). Respond with ONLY a single combined JSON object mapping every "
+        'rule_id to its result — {"description": <short suggestion>, "reasoning": '
+        '<one sentence>}, ... — one object with all rule_ids as keys, NOT one JSON '
+        "object per line even though the rules above are listed that way. No other "
+        "text, no markdown code fences."
     )
     user_content = "Rules needing descriptions (one JSON object per line):\n" + "\n".join(lines)
 

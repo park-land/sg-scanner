@@ -46,7 +46,9 @@ def _node_from_fixture(fixture):
 
 def _run_posture(fixture, model):
     """Mirrors sgtree.tree.assess_severity_and_posture for one fixture,
-    without needing a full BFS-collected graph (fixtures are single-SG)."""
+    without needing a full BFS-collected graph (fixtures are single-SG).
+    Returns (findings, signals) — signals is returned too so the caller can
+    attach it to result rows without recomputing it."""
     from sgtree import checks
 
     node = _node_from_fixture(fixture)
@@ -99,7 +101,7 @@ def _run_posture(fixture, model):
             f['severity_source'] = 'baseline'
             f['_floor_violation'] = False
 
-    return node.findings
+    return node.findings, signals
 
 
 def run(fixtures, model=None):
@@ -111,7 +113,7 @@ def run(fixtures, model=None):
     baseline_delta_improved = 0
 
     for fixture in fixtures:
-        findings = _run_posture(fixture, model)
+        findings, signals = _run_posture(fixture, model)
         for f in findings:
             key = (f['check'], f['resource_id'])
             if key not in fixture.expected_min_severity:
@@ -141,6 +143,21 @@ def run(fixtures, model=None):
                 'exact_match': actual == expected,
                 'within_one_level': e_idx is not None and a_idx is not None and abs(a_idx - e_idx) <= 1,
                 'meets_or_exceeds': e_idx is not None and a_idx is not None and a_idx >= e_idx,
+                # The actual facts the explanation is grounded in — carried
+                # through so a downstream consumer (the LLM-as-judge grading
+                # pass) can check groundedness against what was really given
+                # to analyze_security_posture, not just the bare severity.
+                'rule_facts': None if rule is None else {
+                    'protocol': rule.get('IpProtocol'), 'from_port': rule.get('FromPort'),
+                    'to_port': rule.get('ToPort'), 'cidr': rule.get('CidrIpv4') or rule.get('CidrIpv6'),
+                    'description': rule.get('Description'),
+                },
+                'exposure_signals': {
+                    'is_unused': signals.is_unused,
+                    'has_universal_ingress': signals.has_universal_ingress,
+                    'directly_public_attachments': [a['resource_id'] for a in signals.directly_public_attachments],
+                    'load_balancer_attachments': [a['resource_id'] for a in signals.load_balancer_attachments],
+                },
             })
 
     n = len(results) or 1
