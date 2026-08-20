@@ -92,10 +92,12 @@ def judge_batch(items, model=claude_helper.DEFAULT_MODEL):
         "For text with no associated severity (e.g. an ENI label), score "
         "calibrated on tone matching confidence — a guess stated as fact "
         "when input_facts show weak evidence scores low.\n\n"
-        "Respond with ONLY a JSON object mapping id -> "
-        '{"accurate": 1-5, "grounded": 1-5, "specific": 1-5, "calibrated": 1-5, '
+        "Respond with ONLY a single JSON object mapping every id to its scores — "
+        '{"id1": {"accurate": 1-5, "grounded": 1-5, "specific": 1-5, "calibrated": 1-5, '
         '"grounding_failure": true|false, "notes": "one sentence on the worst issue, or empty if none"}, '
-        "no other text, no markdown code fences."
+        '"id2": {...}, ...} — one combined object with all ids as keys, NOT one '
+        "JSON object per line even though the items above are listed that way. "
+        "No other text, no markdown code fences."
     )
     user_content = "Items to grade (one JSON object per line):\n" + "\n".join(lines)
 

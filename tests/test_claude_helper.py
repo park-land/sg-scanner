@@ -8,6 +8,43 @@ import json
 from sgtree import claude_helper
 
 
+class TestParseJsonObject:
+    """A real live run surfaced this: with enough items in a batch, the
+    model sometimes mirrors the "one JSON object per line" framing used for
+    the *input* into its *output* too — producing several syntactically
+    valid {...} objects, one per line, instead of a single combined object.
+    That's invalid as a whole (multiple top-level JSON values), and without
+    this tolerance the entire batch's real, well-formed answers were
+    silently lost (parsed to {}), not just reformatted."""
+
+    def test_single_combined_object_parses_normally(self):
+        text = json.dumps({'a': 1, 'b': 2})
+        assert claude_helper._parse_json_object(text) == {'a': 1, 'b': 2}
+
+    def test_newline_delimited_objects_are_merged(self):
+        text = '{"a": {"x": 1}}\n{"b": {"x": 2}}\n{"c": {"x": 3}}'
+        assert claude_helper._parse_json_object(text) == {
+            'a': {'x': 1}, 'b': {'x': 2}, 'c': {'x': 3},
+        }
+
+    def test_newline_delimited_with_blank_lines_between(self):
+        text = '{"a": 1}\n\n{"b": 2}\n'
+        assert claude_helper._parse_json_object(text) == {'a': 1, 'b': 2}
+
+    def test_one_bad_line_among_valid_ones_drops_everything(self):
+        # Conservative on purpose: can't tell which lines are trustworthy
+        # once the shape assumption (one JSON object per line) breaks.
+        text = '{"a": 1}\nnot json\n{"b": 2}'
+        assert claude_helper._parse_json_object(text) == {}
+
+    def test_non_object_line_drops_everything(self):
+        text = '{"a": 1}\n[1, 2, 3]'
+        assert claude_helper._parse_json_object(text) == {}
+
+    def test_completely_unparseable_text_returns_empty_dict(self):
+        assert claude_helper._parse_json_object('not json at all') == {}
+
+
 class TestParseGuessWithReasoning:
     def test_parses_well_formed_response(self):
         text = json.dumps({'id-1': {'label': 'RDS Proxy', 'reasoning': 'Description says RDSProxy.'}})
