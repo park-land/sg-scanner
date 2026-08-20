@@ -49,7 +49,7 @@ class TestResolveEnis:
                  'Attachment': {'InstanceId': 'i-0abc'}, 'Description': 'primary'}]
         result = aws.resolve_enis(session=None, region='us-east-1', enis=enis, include_claude=False)
         assert result['eni-1'] == {'resource_type': 'instance', 'resource_id': 'i-0abc',
-                                    'label': 'i-0abc (web-1)', 'inferred': False}
+                                    'label': 'i-0abc (web-1)', 'inferred': False, 'reasoning': None}
 
     def test_pattern_matched_eni_resolves_without_claude(self, monkeypatch):
         monkeypatch.setattr(aws, '_resolve_instance_labels', lambda *a, **k: {})
@@ -59,22 +59,26 @@ class TestResolveEnis:
         assert result['eni-alb']['resource_type'] == 'network_interface'
         assert result['eni-alb']['label'] == "Application Load Balancer 'my-alb'"
         assert result['eni-alb']['inferred'] is False
+        assert result['eni-alb']['reasoning'] is None
 
     def test_unresolved_eni_without_claude_falls_back_to_raw_description(self, monkeypatch):
         monkeypatch.setattr(aws, '_resolve_instance_labels', lambda *a, **k: {})
         enis = [{'NetworkInterfaceId': 'eni-x', 'InterfaceType': 'interface', 'Description': 'mystery thing'}]
         result = aws.resolve_enis(session=None, region='us-east-1', enis=enis, include_claude=False)
         assert result['eni-x'] == {'resource_type': 'network_interface', 'resource_id': 'eni-x',
-                                    'label': 'mystery thing', 'inferred': False}
+                                    'label': 'mystery thing', 'inferred': False, 'reasoning': None}
 
     def test_unresolved_eni_uses_claude_when_enabled(self, monkeypatch):
         monkeypatch.setattr(aws, '_resolve_instance_labels', lambda *a, **k: {})
         from sgtree import claude_helper
-        monkeypatch.setattr(claude_helper, 'classify_enis', lambda enis, model=None: {'eni-x': 'Transfer Family server'})
+        monkeypatch.setattr(claude_helper, 'classify_enis', lambda enis, model=None: {
+            'eni-x': {'label': 'Transfer Family server', 'reasoning': 'Description mentions an SFTP endpoint.'},
+        })
         enis = [{'NetworkInterfaceId': 'eni-x', 'InterfaceType': 'interface', 'Description': 'mystery thing'}]
         result = aws.resolve_enis(session=None, region='us-east-1', enis=enis, include_claude=True)
         assert result['eni-x']['label'] == 'Transfer Family server'
         assert result['eni-x']['inferred'] is True
+        assert result['eni-x']['reasoning'] == 'Description mentions an SFTP endpoint.'
 
 
 class _FakePaginator:

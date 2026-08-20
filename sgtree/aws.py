@@ -111,18 +111,22 @@ def get_account_public_ips(session, region, include_claude=False, claude_model=N
             eni_id = addr.get('NetworkInterfaceId')
             r = resolved.get(eni_id) if eni_id else None
             if r:
-                resource_type, resource_id, label, inferred = r['resource_type'], r['resource_id'], r['label'], r['inferred']
+                resource_type, resource_id, label = r['resource_type'], r['resource_id'], r['label']
+                inferred, reasoning = r['inferred'], r['reasoning']
             elif addr.get('InstanceId'):
-                resource_type, resource_id, label, inferred = 'instance', addr['InstanceId'], addr['InstanceId'], False
+                resource_type, resource_id, label = 'instance', addr['InstanceId'], addr['InstanceId']
+                inferred, reasoning = False, None
             elif eni_id:
-                resource_type, resource_id, label, inferred = 'network_interface', eni_id, eni_id, False
+                resource_type, resource_id, label = 'network_interface', eni_id, eni_id
+                inferred, reasoning = False, None
             else:
                 resource_type, resource_id = 'elastic_ip', addr.get('AllocationId', ip)
-                label, inferred = f"Unassociated Elastic IP {resource_id}", False
+                label, inferred, reasoning = f"Unassociated Elastic IP {resource_id}", False, None
             if eip_name and eip_name not in label:
                 label = f'{label} — EIP "{eip_name}"'
             entries.append({'ip': ip, 'service': 'ec2', 'resource_type': resource_type,
-                             'resource_id': resource_id, 'resource_name': label, 'inferred': inferred})
+                             'resource_id': resource_id, 'resource_name': label,
+                             'inferred': inferred, 'reasoning': reasoning})
             seen_ips.add(ip)
     except Exception:
         pass
@@ -135,11 +139,13 @@ def get_account_public_ips(session, region, include_claude=False, claude_model=N
         r = resolved.get(eni['NetworkInterfaceId'])
         if r:
             entries.append({'ip': pub, 'service': 'ec2', 'resource_type': r['resource_type'],
-                             'resource_id': r['resource_id'], 'resource_name': r['label'], 'inferred': r['inferred']})
+                             'resource_id': r['resource_id'], 'resource_name': r['label'],
+                             'inferred': r['inferred'], 'reasoning': r['reasoning']})
         else:
             entries.append({'ip': pub, 'service': 'ec2', 'resource_type': 'network_interface',
                              'resource_id': eni['NetworkInterfaceId'],
-                             'resource_name': eni.get('Description') or eni['NetworkInterfaceId'], 'inferred': False})
+                             'resource_name': eni.get('Description') or eni['NetworkInterfaceId'],
+                             'inferred': False, 'reasoning': None})
         seen_ips.add(pub)
 
     # 3. NAT Gateway public IPs (kept as an explicit source — reliable and
@@ -152,7 +158,7 @@ def get_account_public_ips(session, region, include_claude=False, claude_model=N
                     if pub and pub not in seen_ips:
                         entries.append({'ip': pub, 'service': 'ec2', 'resource_type': 'nat_gateway',
                                          'resource_id': nat['NatGatewayId'], 'resource_name': nat['NatGatewayId'],
-                                         'inferred': False})
+                                         'inferred': False, 'reasoning': None})
                         seen_ips.add(pub)
     except Exception:
         pass
@@ -263,7 +269,7 @@ def get_all_security_group_ids(session, region):
     return ids
 
 
-def _add(attach_map, sg_id, service, resource_type, resource_id, resource_name=None, inferred=False):
+def _add(attach_map, sg_id, service, resource_type, resource_id, resource_name=None, inferred=False, reasoning=None):
     if not sg_id:
         return
     attach_map.setdefault(sg_id, []).append({
@@ -272,6 +278,7 @@ def _add(attach_map, sg_id, service, resource_type, resource_id, resource_name=N
         'resource_id':   resource_id,
         'resource_name': resource_name or resource_id,
         'inferred':      inferred,   # True if a Claude guess rather than a deterministic lookup
+        'reasoning':     reasoning,  # set only alongside inferred=True — see resolve_enis()
     })
 
 
@@ -358,7 +365,9 @@ def resolve_enis(session, region, enis, include_claude=False, claude_model=None)
     its owning resource, not just the ENI id — used both for the SG
     attachment scan and for tracing an account-owned public IP back to its
     real resource. Returns {eni_id: {'resource_type', 'resource_id', 'label',
-    'inferred'}}.
+    'inferred', 'reasoning'}} — 'reasoning' is only populated for a
+    Claude-inferred entry (explains what in the ENI's metadata led there);
+    it's None for a deterministic match, where there's nothing to explain.
 
     Resolution order: a direct EC2 instance attachment (batch-resolved to its
     Name tag) beats everything else; then the deterministic InterfaceType/
@@ -379,16 +388,17 @@ def resolve_enis(session, region, enis, include_claude=False, claude_model=None)
         label = _classify_eni_deterministic(eni)
         if label:
             results[eni_id] = {'resource_type': 'network_interface', 'resource_id': eni_id,
-                                'label': label, 'inferred': False}
+                                'label': label, 'inferred': False, 'reasoning': None}
         else:
             unresolved.append(eni)
             results[eni_id] = {'resource_type': 'network_interface', 'resource_id': eni_id,
-                                'label': eni.get('Description') or eni_id, 'inferred': False}
+                                'label': eni.get('Description') or eni_id, 'inferred': False, 'reasoning': None}
 
     instance_labels = _resolve_instance_labels(session, region, {iid for _, iid in pending_instance})
     for eni_id, instance_id in pending_instance:
         results[eni_id] = {'resource_type': 'instance', 'resource_id': instance_id,
-                            'label': instance_labels.get(instance_id, instance_id), 'inferred': False}
+                            'label': instance_labels.get(instance_id, instance_id),
+                            'inferred': False, 'reasoning': None}
 
     if unresolved and include_claude:
         from . import claude_helper
@@ -401,8 +411,10 @@ def resolve_enis(session, region, enis, include_claude=False, claude_model=None)
         )
         for eni in unresolved:
             eni_id = eni['NetworkInterfaceId']
-            if eni_id in guesses:
-                results[eni_id]['label'] = guesses[eni_id]
+            guess = guesses.get(eni_id)
+            if guess:
+                results[eni_id]['label'] = guess['label']
+                results[eni_id]['reasoning'] = guess['reasoning']
                 results[eni_id]['inferred'] = True
 
     return results
@@ -436,7 +448,8 @@ def get_attachment_map(session, region, errors=None, include_claude=False, claud
             if not r:
                 continue
             for gid in group_ids:
-                _add(attach_map, gid, 'ec2', r['resource_type'], r['resource_id'], r['label'], inferred=r['inferred'])
+                _add(attach_map, gid, 'ec2', r['resource_type'], r['resource_id'], r['label'],
+                     inferred=r['inferred'], reasoning=r['reasoning'])
     except Exception:
         pass
 

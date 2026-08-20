@@ -17,8 +17,22 @@ def check_allowall(rule, sg_name):
     allows_all = rule.get('CidrIpv4') == '0.0.0.0/0' or rule.get('CidrIpv6') == '::/0'
     if not allows_all:
         return None
-    from_port = rule.get('FromPort', 0)
-    to_port   = rule.get('ToPort', 65535)
+    # AWS sets FromPort/ToPort to None (not absent) for an "all traffic"
+    # rule (protocol -1) — dict.get(..., default) only applies its default
+    # when the key is *missing*, so a rule with the key present but None
+    # would otherwise slip through here and crash the comparison below.
+    from_port = rule.get('FromPort')
+    to_port   = rule.get('ToPort')
+    if from_port is None and to_port is None:
+        # A true "all traffic" rule has no port restriction at all — this
+        # is categorically different from a numeric range that merely
+        # happens to include 80/443 (the SAFE_PORTS carve-out below), and
+        # must never be exempted by it. Defaulting to 0-65535 and running
+        # it through that same overlap check would silently wave through
+        # the single most dangerous rule a security group can have.
+        return 'sg_allows_all', f'{sg_name} allows all ingress on all ports (all traffic)'
+    from_port = 0 if from_port is None else from_port
+    to_port   = 65535 if to_port is None else to_port
     if any(from_port <= p <= to_port for p in SAFE_PORTS):
         return None
     port_str = f"port {from_port}" if from_port == to_port else f"ports {from_port}-{to_port}"

@@ -13,7 +13,11 @@ credentials — see README):
   - ENI attachments that don't match a known AWS pattern get a best-guess
     owning resource from Claude instead of a raw description.
   - Root-SG rules with no description get a Claude-suggested one.
-Both degrade silently (falls back to raw AWS data) if Claude is unavailable.
+  - Root-SG rules whose CIDR is external and unmatched in this account get a
+    Claude guess at what the range is, grounded in the rule's description and
+    an RDAP registration lookup (who the range is registered to, and where).
+All of these degrade silently (falls back to raw AWS/RDAP data, or nothing)
+if Claude is unavailable.
 
 Usage:
     ./sg_tree.py sg-0123456789abcdef0
@@ -22,6 +26,7 @@ Usage:
     ./sg_tree.py sg-0123456789abcdef0 --no-attachments      # skip the ~21-service usage scan
     ./sg_tree.py sg-0123456789abcdef0 --no-claude           # skip Claude-assisted enrichment
     ./sg_tree.py sg-0123456789abcdef0 --no-ip-resolution    # skip CIDR -> VPC/subnet/public-IP mapping
+    ./sg_tree.py sg-0123456789abcdef0 --no-rdap             # skip RDAP lookups for external IPs
     ./sg_tree.py sg-0123456789abcdef0 --max-depth 2
 """
 import argparse
@@ -46,6 +51,10 @@ def main():
     parser.add_argument('--no-ip-resolution', action='store_true',
                          help="Skip resolving the root SG's CIDR/prefix-list rules to VPCs/subnets "
                               '(internal) or account-owned public IPs (external).')
+    parser.add_argument('--no-rdap', action='store_true',
+                         help='Skip RDAP registration lookups for external, unmatched CIDRs '
+                              '(no outbound calls to third-party RDAP servers). Claude guesses at '
+                              'those rules from their description alone, if any.')
     parser.add_argument('--claude-model', default=claude_helper.DEFAULT_MODEL,
                          help=f'Model to use for Claude-assisted enrichment (default: {claude_helper.DEFAULT_MODEL}).')
     parser.add_argument('--json', action='store_true', help='Emit machine-readable JSON instead of the tree view.')
@@ -69,6 +78,7 @@ def main():
         include_claude=not args.no_claude,
         claude_model=args.claude_model,
         include_ip_resolution=not args.no_ip_resolution,
+        include_rdap=not args.no_rdap,
     )
 
     if args.json:
@@ -77,6 +87,8 @@ def main():
 
     report.print_tree(result)
     report.print_findings(result.findings)
+    report.print_posture(result)
+    report.print_claude_reasoning(result)
     report.print_errors(result.errors)
 
 
