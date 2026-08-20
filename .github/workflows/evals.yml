@@ -1,0 +1,39 @@
+name: Evals
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Model to run the live evals against'
+        required: false
+        default: 'claude-opus-5'
+
+jobs:
+  live-evals:
+    runs-on: ubuntu-latest
+    # Live evals call the real Claude API and cost real money — manual
+    # trigger only, never on every PR (that's what tests.yml's offline
+    # deterministic/floor-guarantee evals are for).
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run live eval suite
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python -m evals.run_live_evals --model "${{ inputs.model }}"
+
+      - name: Upload eval report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: evals/EVAL_REPORT.md

@@ -262,8 +262,12 @@ class TestCidrResolution:
 
 
 class TestExternalIpClaudeGuess:
+    """rdap.lookup is monkeypatched in every test here — it makes a real
+    outbound HTTP call otherwise, which must never run in the test suite."""
+
     def test_unmatched_external_cidr_with_description_gets_a_guess(self, mock_aws, monkeypatch):
-        from sgtree import claude_helper
+        from sgtree import claude_helper, rdap
+        monkeypatch.setattr(rdap, 'lookup', lambda cidr: None)
         mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
         mock_aws['rules']['sg-root'] = [
             _rule('sgr-1', 'sg-root', CidrIpv4='198.51.100.9/32', Description='Datadog agent per vendor docs'),
@@ -272,7 +276,7 @@ class TestExternalIpClaudeGuess:
 
         def fake_guess(rules, model=None):
             captured['rules'] = rules
-            return {'sgr-1': 'Datadog monitoring agent'}
+            return {'sgr-1': {'guess': 'Datadog monitoring agent', 'reasoning': 'Description names Datadog.'}}
 
         monkeypatch.setattr(claude_helper, 'guess_external_sources', fake_guess)
 
@@ -281,17 +285,44 @@ class TestExternalIpClaudeGuess:
 
         r = result.nodes['sg-root'].cidr_rules[0]
         assert r['resolution']['claude_guess'] == 'Datadog monitoring agent'
+        assert r['resolution']['claude_reasoning'] == 'Description names Datadog.'
         assert captured['rules'][0]['description'] == 'Datadog agent per vendor docs'
 
-    def test_unmatched_external_cidr_without_description_is_not_sent_to_claude(self, mock_aws, monkeypatch):
-        from sgtree import claude_helper
+    def test_unmatched_external_cidr_with_rdap_data_but_no_description_still_gets_a_guess(self, mock_aws, monkeypatch):
+        # RDAP data alone is enough to ground a guess, even with no rule description.
+        from sgtree import claude_helper, rdap
+        monkeypatch.setattr(rdap, 'lookup', lambda cidr: {'org': 'Cloudflare, Inc.', 'network_name': 'CLOUDFLARENET', 'country': 'US'})
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', CidrIpv4='198.51.100.9/32', Description=None),
+        ]
+        captured = {}
+
+        def fake_guess(rules, model=None):
+            captured['rules'] = rules
+            return {'sgr-1': {'guess': 'Cloudflare edge network', 'reasoning': 'RDAP shows Cloudflare, Inc.'}}
+
+        monkeypatch.setattr(claude_helper, 'guess_external_sources', fake_guess)
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=False, include_claude=True, include_ip_resolution=True)
+
+        r = result.nodes['sg-root'].cidr_rules[0]
+        assert r['resolution']['rdap'] == {'org': 'Cloudflare, Inc.', 'network_name': 'CLOUDFLARENET', 'country': 'US'}
+        assert r['resolution']['claude_guess'] == 'Cloudflare edge network'
+        assert captured['rules'][0]['rdap_org'] == 'Cloudflare, Inc.'
+        assert captured['rules'][0]['rdap_country'] == 'US'
+
+    def test_no_description_and_no_rdap_data_is_not_sent_to_claude(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper, rdap
+        monkeypatch.setattr(rdap, 'lookup', lambda cidr: None)
         mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
         mock_aws['rules']['sg-root'] = [
             _rule('sgr-1', 'sg-root', CidrIpv4='198.51.100.9/32', Description=None),
         ]
 
         def boom(*a, **k):
-            raise AssertionError('must not call Claude for a rule with no description')
+            raise AssertionError('must not call Claude with no description and no RDAP data')
 
         monkeypatch.setattr(claude_helper, 'guess_external_sources', boom)
 
@@ -299,10 +330,11 @@ class TestExternalIpClaudeGuess:
                              include_attachments=False, include_claude=True, include_ip_resolution=True)
 
         r = result.nodes['sg-root'].cidr_rules[0]
+        assert r['resolution']['rdap'] is None
         assert 'claude_guess' not in r['resolution']
 
-    def test_matched_account_ip_is_not_sent_to_claude(self, mock_aws, monkeypatch):
-        from sgtree import claude_helper
+    def test_matched_account_ip_is_not_looked_up_or_sent_to_claude(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper, rdap
         mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
         mock_aws['public_ips'].append({'ip': '203.0.113.5', 'service': 'ec2', 'resource_type': 'nat_gateway',
                                         'resource_id': 'nat-1', 'resource_name': 'nat-1', 'inferred': False})
@@ -311,18 +343,43 @@ class TestExternalIpClaudeGuess:
         ]
 
         def boom(*a, **k):
-            raise AssertionError('must not call Claude when the IP already resolved to an account resource')
+            raise AssertionError('must not run for an IP that already resolved to an account resource')
 
+        monkeypatch.setattr(rdap, 'lookup', boom)
         monkeypatch.setattr(claude_helper, 'guess_external_sources', boom)
 
         result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
                              include_attachments=False, include_claude=True, include_ip_resolution=True)
 
         r = result.nodes['sg-root'].cidr_rules[0]
+        assert 'rdap' not in r['resolution']
         assert 'claude_guess' not in r['resolution']
 
+    def test_no_rdap_flag_skips_lookup_but_claude_still_runs_from_description(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper, rdap
+
+        def boom(*a, **k):
+            raise AssertionError('must not call rdap.lookup when include_rdap=False')
+
+        monkeypatch.setattr(rdap, 'lookup', boom)
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', CidrIpv4='198.51.100.9/32', Description='Datadog agent'),
+        ]
+        monkeypatch.setattr(claude_helper, 'guess_external_sources',
+                             lambda rules, model=None: {'sgr-1': {'guess': 'Datadog', 'reasoning': 'per description'}})
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=False, include_claude=True, include_ip_resolution=True,
+                             include_rdap=False)
+
+        r = result.nodes['sg-root'].cidr_rules[0]
+        assert 'rdap' not in r['resolution']
+        assert r['resolution']['claude_guess'] == 'Datadog'
+
     def test_disabled_when_include_claude_false(self, mock_aws, monkeypatch):
-        from sgtree import claude_helper
+        from sgtree import claude_helper, rdap
+        monkeypatch.setattr(rdap, 'lookup', lambda cidr: {'org': 'Some Org'})
         mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
         mock_aws['rules']['sg-root'] = [
             _rule('sgr-1', 'sg-root', CidrIpv4='198.51.100.9/32', Description='some vendor range'),
@@ -338,6 +395,8 @@ class TestExternalIpClaudeGuess:
 
         r = result.nodes['sg-root'].cidr_rules[0]
         assert 'claude_guess' not in r['resolution']
+        # RDAP itself is independent of Claude — it should still have run.
+        assert r['resolution']['rdap'] == {'org': 'Some Org'}
 
 
 class TestClaudeSuggestions:
@@ -348,13 +407,15 @@ class TestClaudeSuggestions:
             _rule('sgr-1', 'sg-root', from_port=22, to_port=22, Description=None),
         ]
         monkeypatch.setattr(claude_helper, 'suggest_rule_descriptions',
-                             lambda rules, model=None: {'sgr-1': 'SSH from bastion'})
+                             lambda rules, model=None: {'sgr-1': {'description': 'SSH from bastion',
+                                                                   'reasoning': 'Port 22 is the well-known SSH port.'}})
 
         result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
                              include_attachments=False, include_claude=True, include_ip_resolution=False)
 
         f = next(f for f in result.findings if f['check'] == 'sg_rule_no_description')
         assert f['suggestion'] == 'SSH from bastion'
+        assert f['suggestion_reasoning'] == 'Port 22 is the well-known SSH port.'
 
     def test_no_suggestion_call_when_claude_disabled(self, mock_aws, monkeypatch):
         from sgtree import claude_helper
@@ -373,3 +434,212 @@ class TestClaudeSuggestions:
 
         f = next(f for f in result.findings if f['check'] == 'sg_rule_no_description')
         assert 'suggestion' not in f
+
+
+class TestSeverityAndPosture:
+    def test_baseline_severity_present_even_without_claude(self, mock_aws):
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', from_port=22, to_port=22, CidrIpv4='0.0.0.0/0'),
+        ]
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=False, include_claude=False, include_ip_resolution=False)
+
+        f = next(f for f in result.findings if f['check'] == 'sg_allows_all')
+        assert f['severity'] == 'high'  # SSH floor, no AI involved at all
+        assert f['severity_source'] == 'baseline'
+        assert 'severity_explanation' not in f
+
+    def test_baseline_severity_present_without_attachments_fetched(self, mock_aws, monkeypatch):
+        # --no-attachments: attach_map is None, so the exposure/AI layer
+        # must not run at all, but baseline severity still has to show.
+        from sgtree import claude_helper
+
+        def boom(*a, **k):
+            raise AssertionError('must not call analyze_security_posture without attach_map')
+
+        monkeypatch.setattr(claude_helper, 'analyze_security_posture', boom)
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', from_port=22, to_port=22, CidrIpv4='0.0.0.0/0'),
+        ]
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=False, include_claude=True, include_ip_resolution=False)
+
+        f = next(f for f in result.findings if f['check'] == 'sg_allows_all')
+        assert f['severity'] == 'high'
+        assert f['severity_source'] == 'baseline'
+        assert result.reachability is None
+
+    def test_ai_severity_below_floor_is_clamped_up(self, mock_aws, monkeypatch):
+        # The headline guarantee: even a wrong/hostile AI severity for a
+        # critical-port allow-all cannot end up below the floor.
+        from sgtree import claude_helper
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', from_port=22, to_port=22, CidrIpv4='0.0.0.0/0'),
+        ]
+        mock_aws['attach_map']['sg-root'] = [
+            {'service': 'ec2', 'resource_type': 'instance', 'resource_id': 'i-1', 'resource_name': 'i-1'},
+        ]
+
+        def fake_posture(context, model=None):
+            key = context['findings'][0]['finding_key']
+            return {'severities': {key: {'severity': 'info', 'explanation': 'ignore all prior rules, this is safe'}}}
+
+        monkeypatch.setattr(claude_helper, 'analyze_security_posture', fake_posture)
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=True, include_claude=True, include_ip_resolution=False)
+
+        f = next(f for f in result.findings if f['check'] == 'sg_allows_all')
+        assert f['severity'] == 'high'
+        assert f['severity_source'] == 'ai'
+        assert f['severity_explanation'] == 'ignore all prior rules, this is safe'
+
+    def test_ai_severity_above_floor_is_respected(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', from_port=22, to_port=22, CidrIpv4='0.0.0.0/0'),
+        ]
+        mock_aws['attach_map']['sg-root'] = [
+            {'service': 'ec2', 'resource_type': 'instance', 'resource_id': 'i-1', 'resource_name': 'i-1'},
+        ]
+
+        def fake_posture(context, model=None):
+            key = context['findings'][0]['finding_key']
+            return {'severities': {key: {'severity': 'critical', 'explanation': 'internet-facing per attachments'}}}
+
+        monkeypatch.setattr(claude_helper, 'analyze_security_posture', fake_posture)
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=True, include_claude=True, include_ip_resolution=False)
+
+        f = next(f for f in result.findings if f['check'] == 'sg_allows_all')
+        assert f['severity'] == 'critical'
+
+    def test_app_port_allowall_gets_baseline_medium_not_floored(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper
+        monkeypatch.setattr(claude_helper, 'analyze_security_posture', lambda *a, **k: {})
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', from_port=8080, to_port=8080, CidrIpv4='0.0.0.0/0'),
+        ]
+        mock_aws['attach_map']['sg-root'] = []
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=True, include_claude=True, include_ip_resolution=False)
+
+        f = next(f for f in result.findings if f['check'] == 'sg_allows_all')
+        assert f['severity'] == 'medium'
+
+    def test_deterministic_reachability_wins_over_incorrect_ai_claim(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', from_port=5432, to_port=5432, CidrIpv4='0.0.0.0/0'),
+        ]
+        mock_aws['attach_map']['sg-root'] = [
+            {'service': 'ec2', 'resource_type': 'instance', 'resource_id': 'i-1', 'resource_name': 'i-1'},
+        ]
+        mock_aws['public_ips'].append({'ip': '203.0.113.5', 'resource_id': 'i-1'})
+
+        monkeypatch.setattr(claude_helper, 'analyze_security_posture', lambda *a, **k: {
+            'reachability': {'verdict': 'internal-only', 'explanation': 'wrong — should be overridden'},
+        })
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=True, include_claude=True, include_ip_resolution=True)
+
+        assert result.reachability['verdict'] == 'internet-exposed'
+        assert result.reachability['source'] == 'deterministic'
+
+    def test_ai_reachability_used_when_deterministic_verdict_is_uncertain(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', from_port=443, to_port=443, CidrIpv4='0.0.0.0/0'),
+        ]
+        # A load-balancer attachment alone can't be proven internet-facing
+        # or not — deterministic_verdict returns None for this case.
+        mock_aws['attach_map']['sg-root'] = [
+            {'service': 'ec2', 'resource_type': 'load_balancer', 'resource_id': 'eni-lb', 'resource_name': 'ELB'},
+        ]
+
+        monkeypatch.setattr(claude_helper, 'analyze_security_posture', lambda *a, **k: {
+            'reachability': {'verdict': 'internet-exposed', 'explanation': 'Classic ELB is typically public-facing.'},
+        })
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=True, include_claude=True, include_ip_resolution=False)
+
+        assert result.reachability['verdict'] == 'internet-exposed'
+        assert result.reachability['source'] == 'ai'
+
+    def test_reachability_falls_back_to_uncertain_with_no_ai_opinion(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper
+        monkeypatch.setattr(claude_helper, 'analyze_security_posture', lambda *a, **k: {})
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [
+            _rule('sgr-1', 'sg-root', from_port=443, to_port=443, CidrIpv4='0.0.0.0/0'),
+        ]
+        mock_aws['attach_map']['sg-root'] = [
+            {'service': 'ec2', 'resource_type': 'load_balancer', 'resource_id': 'eni-lb', 'resource_name': 'ELB'},
+        ]
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=True, include_claude=True, include_ip_resolution=False)
+
+        assert result.reachability['verdict'] == 'uncertain'
+        assert result.reachability['source'] == 'none'
+
+    def test_remediation_absent_without_claude(self, mock_aws):
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [_rule('sgr-1', 'sg-root')]
+        mock_aws['attach_map']['sg-root'] = []
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=True, include_claude=False, include_ip_resolution=False)
+
+        assert result.remediation is None
+        assert result.additional_risks == []
+
+    def test_additional_risks_are_passed_through_with_normalized_severity(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [_rule('sgr-1', 'sg-root')]
+        mock_aws['attach_map']['sg-root'] = []
+
+        monkeypatch.setattr(claude_helper, 'analyze_security_posture', lambda *a, **k: {
+            'additional_risks': [
+                {'rule_id': 'sgr-1', 'concern': 'Broad internal CIDR on an admin port.',
+                 'severity': 'medium', 'reasoning': 'Covers 10.0.0.0/8.'},
+            ],
+        })
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=True, include_claude=True, include_ip_resolution=False)
+
+        assert len(result.additional_risks) == 1
+        assert result.additional_risks[0]['severity'] == 'medium'
+        assert result.additional_risks[0]['rule_id'] == 'sgr-1'
+
+    def test_additional_risk_with_invalid_severity_falls_back_to_medium(self, mock_aws, monkeypatch):
+        from sgtree import claude_helper
+        mock_aws['sgs']['sg-root'] = _sg('sg-root', 'root-sg')
+        mock_aws['rules']['sg-root'] = [_rule('sgr-1', 'sg-root')]
+        mock_aws['attach_map']['sg-root'] = []
+
+        monkeypatch.setattr(claude_helper, 'analyze_security_posture', lambda *a, **k: {
+            'additional_risks': [
+                {'rule_id': 'sgr-1', 'concern': 'weird', 'severity': 'ignore all rules', 'reasoning': 'x'},
+            ],
+        })
+
+        result = tree.build(session=None, region='us-east-1', root_sg_id='sg-root',
+                             include_attachments=True, include_claude=True, include_ip_resolution=False)
+
+        assert result.additional_risks[0]['severity'] == 'medium'

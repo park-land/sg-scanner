@@ -30,6 +30,24 @@ class TestCheckAllowall:
         rule = {'IsEgress': True, 'CidrIpv4': '0.0.0.0/0', 'FromPort': 22, 'ToPort': 22}
         assert checks.check_allowall(rule, 'my-sg') is None
 
+    def test_all_traffic_rule_with_none_ports_does_not_crash(self):
+        # AWS sets FromPort/ToPort to None (present, not absent) for an
+        # "all traffic" rule (protocol -1) — this must be treated as the
+        # full 0-65535 range, not crash comparing None <= port.
+        rule = {'IsEgress': False, 'IpProtocol': '-1', 'CidrIpv4': '0.0.0.0/0', 'FromPort': None, 'ToPort': None}
+        hit = checks.check_allowall(rule, 'my-sg')
+        assert hit is not None
+        assert hit[0] == 'sg_allows_all'
+
+    def test_all_traffic_rule_is_never_exempted_by_the_safe_port_carve_out(self):
+        # 0.0.0.0/0 spans 80/443 too, but "all traffic, no port restriction"
+        # must never get the SAFE_PORTS pass a merely-broad numeric range
+        # (e.g. 1-1000) can get — it's the single most dangerous rule shape.
+        rule = {'IsEgress': False, 'IpProtocol': '-1', 'CidrIpv4': '0.0.0.0/0', 'FromPort': None, 'ToPort': None}
+        hit = checks.check_allowall(rule, 'my-sg')
+        assert hit is not None
+        assert 'all ports' in hit[1]
+
     def test_ignores_non_universal_cidr(self):
         rule = {'IsEgress': False, 'CidrIpv4': '10.0.0.0/8', 'FromPort': 22, 'ToPort': 22}
         assert checks.check_allowall(rule, 'my-sg') is None

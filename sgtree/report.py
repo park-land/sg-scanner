@@ -11,6 +11,18 @@ STATUS_LABEL = {
     'external':  '  [EXTERNAL / CROSS-ACCOUNT — not traversed]',
 }
 
+_SEVERITY_ORDER = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+
+_REACHABILITY_SOURCE_TAG = {
+    'deterministic': '(proven from attachments)',
+    'ai':            '(Claude — attachment type not independently verified)',
+    'none':          '(no signal available)',
+}
+
+
+def _severity_tag(sev):
+    return f'[{sev.upper()}]' if sev else '[?]'
+
 
 def _node_line(node):
     label = node.name or node.sg_id
@@ -68,10 +80,13 @@ def _resolution_summary(resolution):
                 for m in matches
             )
             return f"external — matches account resource(s): {parts}"
+
+        # RDAP registration data (resolution['rdap']) still feeds the Claude
+        # guess below and shows up in the "Claude reasoning" section — kept
+        # out of this line so a single rule doesn't run long.
         guess = resolution.get('claude_guess')
-        if guess:
-            return f'external — no match in this account; Claude guess (from rule description): "{guess}"'
-        return "external — no match in this account"
+        base = "external — no match in this account"
+        return f'{base}; Claude guess: "{guess}"' if guess else base
     if kind == 'prefix_list':
         name = resolution.get('name')
         pl_id = resolution.get('prefix_list_id')
@@ -215,13 +230,90 @@ def print_findings(findings):
     print(f"{'=' * 60}\n")
 
     for check, items in sorted(by_check.items()):
+        items = sorted(items, key=lambda f: _SEVERITY_ORDER.get(f.get('severity'), 99))
         print(f"{check.upper().replace('_', ' ')}  ({len(items)})")
         print('-' * 40)
         for f in items:
-            print(f"  [{f['sg_id']}] {f['detail']}")
+            print(f"  {_severity_tag(f.get('severity'))} [{f['sg_id']}] {f['detail']}")
+            if f.get('severity_explanation'):
+                print(f"      severity: {f['severity_explanation']}")
             if f.get('suggestion'):
                 print(f"      → Claude-suggested description: \"{f['suggestion']}\"")
         print()
+
+
+def print_posture(result):
+    """Reachability verdict, prioritized remediation, and AI-flagged
+    additive risks — the contextual layer on top of the deterministic
+    findings above. additional_risks are deliberately never mixed into
+    print_findings' output or count: they're Claude's own read of what else
+    looks risky, shown that way, not folded in as if a check had fired."""
+    if result.reachability:
+        r = result.reachability
+        print(f"\n{'=' * 60}")
+        print("  Reachability")
+        print(f"{'=' * 60}\n")
+        print(f"  {r['verdict'].upper()}  {_REACHABILITY_SOURCE_TAG.get(r['source'], '')}")
+        if r.get('explanation'):
+            print(f"      {r['explanation']}")
+
+    if result.remediation:
+        print(f"\n{'=' * 60}")
+        print("  Remediation (Claude)")
+        print(f"{'=' * 60}\n")
+        if result.remediation.get('top_fix'):
+            print(f"  Top fix: {result.remediation['top_fix']}")
+        if result.remediation.get('summary'):
+            print(f"  {result.remediation['summary']}")
+
+    if result.additional_risks:
+        print(f"\n{'=' * 60}")
+        print(f"  Additional AI-flagged risks ({len(result.additional_risks)}) — not deterministic findings")
+        print(f"{'=' * 60}\n")
+        for risk in result.additional_risks:
+            print(f"  {_severity_tag(risk.get('severity'))} rule {risk['rule_id']}: {risk['concern']}")
+            if risk.get('reasoning'):
+                print(f"      because: {risk['reasoning']}")
+
+
+def print_claude_reasoning(result):
+    """One line per Claude-derived item in this report (an inferred
+    attachment label, a suggested rule description, an external-IP guess),
+    each with the one-sentence explanation Claude gave for it — so a reader
+    can see what the short answer was actually based on, not just take it on
+    faith. Nothing to print if Claude wasn't used or made no guesses."""
+    entries = []  # (sg_id, headline, reasoning)
+
+    for node in result.nodes.values():
+        for a in node.attachments:
+            if a.get('inferred') and a.get('reasoning'):
+                entries.append((node.sg_id, f'attachment {a["resource_id"]} → "{a["resource_name"]}"', a['reasoning']))
+
+    for f in result.findings:
+        if f.get('suggestion') and f.get('suggestion_reasoning'):
+            entries.append((f['sg_id'], f'rule {f["resource_id"]} → suggested description "{f["suggestion"]}"',
+                             f['suggestion_reasoning']))
+
+    root_node = result.nodes.get(result.root_sg_id)
+    if root_node:
+        for r in root_node.cidr_rules:
+            resolution = r['resolution']
+            guess = resolution.get('claude_guess')
+            reasoning = resolution.get('claude_reasoning')
+            if guess and reasoning:
+                source = resolution.get('cidr') or resolution.get('prefix_list_id') or '?'
+                entries.append((root_node.sg_id, f'rule {r["rule_id"]} ({source}) → guess "{guess}"', reasoning))
+
+    if not entries:
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f"  Claude reasoning ({len(entries)})")
+    print(f"{'=' * 60}\n")
+    for sg_id, headline, reasoning in entries:
+        print(f"  [{sg_id}] {headline}")
+        print(f"      because: {reasoning}")
+    print()
 
 
 def print_errors(errors):
@@ -242,11 +334,14 @@ def to_json(result):
         return dataclasses.asdict(e)
 
     return json.dumps({
-        'root_sg_id': result.root_sg_id,
-        'region':     result.region,
-        'account_id': result.account_id,
-        'nodes':      {sg_id: node_dict(n) for sg_id, n in result.nodes.items()},
-        'edges':      [edge_dict(e) for e in result.edges],
-        'findings':   result.findings,
-        'errors':     result.errors,
+        'root_sg_id':        result.root_sg_id,
+        'region':            result.region,
+        'account_id':        result.account_id,
+        'nodes':             {sg_id: node_dict(n) for sg_id, n in result.nodes.items()},
+        'edges':             [edge_dict(e) for e in result.edges],
+        'findings':          result.findings,
+        'errors':            result.errors,
+        'reachability':      result.reachability,
+        'remediation':       result.remediation,
+        'additional_risks':  result.additional_risks,
     }, indent=2, default=str)
